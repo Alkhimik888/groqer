@@ -2,7 +2,7 @@
 
 Push-to-talk dictation for Windows. Press **Ctrl+Space**, speak, press it again — the text
 appears in whatever window you were typing into. Works in any application — browser, editor,
-chat, terminal — and is accurate on both Russian and English.
+chat, terminal — in any of the 100 languages `whisper-large-v3` supports.
 
 ![Groqer window](docs/screenshot.png)
 

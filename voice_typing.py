@@ -145,7 +145,7 @@ LANGUAGE_NAMES = {
     "zh": "Chinese",
 }
 # Сверху то, чем пользуются каждый день, дальше — алфавит.
-PINNED = ["auto", "ru", "en"]
+PINNED = ["auto", "en", "es", "ru"]
 LANGUAGE_ORDER = PINNED + sorted(
     (c for c in LANGUAGE_NAMES if c not in PINNED),
     key=lambda c: LANGUAGE_NAMES[c])
