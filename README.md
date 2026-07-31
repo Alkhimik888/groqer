@@ -90,8 +90,8 @@ dictated from. The status line tells you which happened:
 
 There is no practical length limit — a lecture, an interview, a two-hour meeting all work.
 
-- Recordings over 30 minutes are split into pieces at the nearest quiet moment (so no word is
-  cut in half), transcribed separately, and joined back together.
+- Long recordings are split into ~15-minute pieces at the nearest quiet moment (so no word
+  is cut in half), transcribed separately, and joined back together.
 - Transcripts longer than about a minute of speech are saved to `transcripts\*.txt`, with a
   link to the file in the history list.
 - A single recording is capped at 7 hours.
