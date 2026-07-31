@@ -254,6 +254,8 @@ def read_api_key():
 
 
 def write_api_key(key):
+    """Пишем через временный файл с атомарной заменой: обрыв посреди прямой
+    перезаписи оставил бы файл с обрезанным ключом, и рабочий ключ пропал бы."""
     target = next((p for p in KEY_FILES if os.path.exists(p)), KEY_FILES[0])
     folder = os.path.dirname(target)
     if folder:
@@ -264,8 +266,12 @@ def write_api_key(key):
             lines = [ln for ln in f.read().splitlines()
                      if not ln.startswith("GROQ_API_KEY=")]
     lines.append(f"GROQ_API_KEY={key}")
-    with open(target, "w", encoding="utf-8") as f:
+    temp = target + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, target)
 
 
 def foreground_window():
@@ -324,40 +330,63 @@ class Recorder:
 
 def save_transcript(text):
     """Длинную расшифровку кладём файлом рядом с приложением: в окно такой
-    текст не помещается, а терять его нельзя. Возвращает путь или None."""
+    текст не помещается, а терять его нельзя.
+
+    Возвращает (путь, ошибка): молчаливый None выглядел бы как «сохранено»,
+    хотя на полном диске текст остался бы только в буфере обмена.
+    """
     try:
-        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
-        name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
-        path = os.path.join(TRANSCRIPTS_DIR, name)
+        path = new_path(".txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
-        return path
-    except Exception:
-        return None
+        return path, None
+    except Exception as e:
+        return None, type(e).__name__
+
+
+def new_path(suffix):
+    """Свободное имя в папке расшифровок.
+
+    Секундной точности мало: две записи, законченные в одну секунду, дописались
+    бы в один файл или затёрли готовый. Файл создаём эксклюзивно, поэтому имя
+    занимается атомарно, а не «проверили и надеемся».
+    """
+    os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    for attempt in range(1, 1000):
+        tail = "" if attempt == 1 else f"-{attempt}"
+        path = os.path.join(TRANSCRIPTS_DIR, f"{stamp}{tail}{suffix}")
+        try:
+            with open(path, "x", encoding="utf-8"):
+                pass
+            return path
+        except FileExistsError:
+            continue
+    raise OSError("no free name in transcripts folder")
 
 
 def append_partial(path, text):
     """Дописываем каждый расшифрованный кусок сразу на диск: если дальше
-    оборвётся сеть, сделанное уже не пропадёт вместе с процессом."""
+    оборвётся сеть, сделанное уже не пропадёт вместе с процессом.
+
+    Возвращает путь только при подтверждённой записи — иначе None, иначе
+    интерфейс показал бы ссылку на файл, которого нет.
+    """
     try:
-        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
         if path is None:
-            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            path = os.path.join(TRANSCRIPTS_DIR, stamp + ".txt")
+            path = new_path(".txt")
         with open(path, "a", encoding="utf-8") as f:
             f.write(text.strip() + " ")
         return path
     except Exception:
-        return path
+        return None
 
 
 def save_audio(audio):
     """Сырое аудио на диск — последняя линия обороны, когда расшифровать
     не удалось или пользователь выходит прямо во время записи."""
     try:
-        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        path = os.path.join(TRANSCRIPTS_DIR, stamp + ".flac")
+        path = new_path(".flac")
         sf.write(path, audio, SAMPLE_RATE, format="FLAC")
         return path
     except Exception:
@@ -384,15 +413,21 @@ def split_audio(audio):
 
     search = CHUNK_SEARCH_SECONDS * SAMPLE_RATE
     window = SAMPLE_RATE // 10                      # шаг поиска — 100 мс
-    cuts, pos = [], chunk
+    cuts, prev = [], 0
+    pos = chunk
     while pos < len(audio):
-        lo, hi = max(0, pos - search), min(len(audio), pos + search)
+        # Ищем паузу только ДО расчётной точки: сдвиг вперёд у каждой границы
+        # накапливался бы, и кусок вырастал бы за обещанные полчаса.
+        lo, hi = max(prev + window, pos - search), min(len(audio), pos)
         quietest, best = None, pos
-        for start in range(lo, hi - window, window):
-            level = np.abs(audio[start:start + window]).mean()
+        for start in range(lo, max(lo + window, hi - window), window):
+            # int16 не умеет представить -32768, и abs() переполняется:
+            # громкий щелчок выглядел бы самым тихим местом записи
+            level = np.abs(audio[start:start + window].astype(np.int32)).mean()
             if quietest is None or level < quietest:
                 quietest, best = level, start + window // 2
         cuts.append(best)
+        prev = best
         pos = best + chunk
 
     parts, prev = [], 0
@@ -405,6 +440,19 @@ def split_audio(audio):
 
 class Transient(RuntimeError):
     """Сбой, который имеет смысл повторить: сеть, таймаут, 429, 5xx."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(response):
+    """Groq сам говорит, сколько ждать при лимите. Слушать его надёжнее
+    собственных пауз, но потолок нужен — иначе повиснем на полчаса."""
+    try:
+        return max(0.0, min(float(response.headers.get("Retry-After", "")), 90.0))
+    except Exception:
+        return None
 
 
 def transcribe(audio, api_key, language):
@@ -425,16 +473,20 @@ def transcribe(audio, api_key, language):
     if r.status_code == 413:
         raise RuntimeError("chunk too large")
     if r.status_code == 429 or r.status_code >= 500:
-        raise Transient(f"groq {r.status_code}")
+        raise Transient(f"groq {r.status_code}", retry_after_seconds(r))
     if r.status_code >= 400:
         raise RuntimeError(f"groq {r.status_code}")
-    return (r.json().get("text") or "").strip()
+    try:
+        payload = r.json()
+    except ValueError:
+        # 200 с обрезанным телом — это сбой доставки, а не отказ: повторяем
+        raise Transient("bad response body")
+    return (payload.get("text") or "").strip()
 
 
 def transcribe_retrying(audio, api_key, language, on_wait=None):
     """Повторяем временные сбои: один моргнувший wi-fi не должен стоить
     пользователю всей записи."""
-    delay = RETRY_DELAYS[0]
     for attempt, delay in enumerate(RETRY_DELAYS + [None], 1):
         try:
             audio.seek(0)
@@ -442,9 +494,10 @@ def transcribe_retrying(audio, api_key, language, on_wait=None):
         except Transient as e:
             if delay is None:
                 raise RuntimeError(f"{e} — gave up after {attempt} tries")
+            wait = e.retry_after if e.retry_after is not None else delay
             if on_wait:
-                on_wait(str(e), delay)
-            time.sleep(delay)
+                on_wait(str(e), int(round(wait)))
+            time.sleep(wait)
 
 
 # --- структуры Windows для индикатора ----------------------------------------
@@ -667,6 +720,7 @@ class App(tk.Tk):
         self.history = []
         self.tick_job = None
         self.capturing = False
+        self.pending_hotkey = None
         self.shutting_down = False
         self.quit_waits = 0
         self.target_window = None
@@ -899,10 +953,12 @@ class App(tk.Tk):
         try:
             self.hotkey_handle = keyboard.add_hotkey(
                 self.hotkey, lambda: self.after(0, self.toggle), suppress=True)
+            return True
         except Exception as e:
             self.hotkey_handle = None
             self.after(100, lambda: self._set_status(f"hotkey busy: {e}",
                                                      error=True))
+            return False
 
     def _render_hotkey(self):
         self.hotkey_label.config(text=f"{pretty_hotkey(self.hotkey)}   ·  click to change",
@@ -930,11 +986,11 @@ class App(tk.Tk):
         self.after(0, self._finish_capture, combo)
 
     def _finish_capture(self, combo):
+        if self.shutting_down:
+            return
         # без модификатора хоткей отбирал бы обычную клавишу у всей системы
         if combo and any(m in combo for m in MODIFIERS):
-            self.hotkey = combo
-            self.cfg["hotkey"] = combo
-            save_config(self.cfg)
+            self.pending_hotkey = combo
         elif combo:
             self._set_status("need a modifier key", error=True)
         self._render_hotkey()
@@ -944,7 +1000,23 @@ class App(tk.Tk):
         self.after(600, self._rearm_hotkey)
 
     def _rearm_hotkey(self):
-        self._bind_hotkey()
+        """Записываем комбинацию в настройки только после успешной привязки:
+        занятый другим приложением хоткей иначе остался бы в конфиге, а
+        глобальной клавиши не было бы вовсе."""
+        if self.shutting_down:
+            return
+        previous, candidate = self.hotkey, self.pending_hotkey or self.hotkey
+        self.pending_hotkey = None
+        self.hotkey = candidate
+        if self._bind_hotkey():
+            if candidate != previous:
+                self.cfg["hotkey"] = candidate
+                save_config(self.cfg)
+        else:
+            self.hotkey = previous
+            self._bind_hotkey()
+            self._set_status("hotkey taken · kept previous", error=True)
+        self._render_hotkey()
         self.capturing = False
 
     # --- запись --------------------------------------------------------------
@@ -997,62 +1069,86 @@ class App(tk.Tk):
         self._set_status("transcribing")
         threading.Thread(target=self._work, args=(audio,), daemon=True).start()
 
-    def _transcribe_piece(self, audio):
+    def _transcribe_piece(self, audio, keep):
         """Один кусок. Если закодированный файл не влезает в лимит Groq,
-        делим пополам — иначе запрос вернёт ошибку и кусок пропадёт."""
+        делим пополам.
+
+        Готовый текст отдаём через keep() сразу, а не возвращаем наверх: при
+        делении пополам падение второй половины иначе унесло бы с собой уже
+        распознанную первую.
+        """
         buf = encode_flac(audio)
         if buf.getbuffer().nbytes > MAX_UPLOAD_BYTES and \
                 len(audio) > SAMPLE_RATE * 60:
             middle = len(audio) // 2
-            halves = [self._transcribe_piece(audio[:middle]),
-                      self._transcribe_piece(audio[middle:])]
-            return " ".join(h for h in halves if h)
-        return transcribe_retrying(
+            self._transcribe_piece(audio[:middle], keep)
+            self._transcribe_piece(audio[middle:], keep)
+            return
+        text = transcribe_retrying(
             buf, self.api_key, self.lang,
             on_wait=lambda reason, delay: self.after(
                 0, self._set_status, f"retry in {delay}s · {reason}"))
+        if text:
+            keep(text)
 
     def _work(self, audio):
         """Длинная запись уходит кусками по очереди. Каждый готовый кусок
         сразу пишется на диск, поэтому обрыв на середине не стоит всей
         записи."""
-        done, path = [], None
+        done, state = [], {"path": None, "write_failed": False}
+
+        def keep(text):
+            done.append(text)
+            saved = append_partial(state["path"], text)
+            if saved:
+                state["path"] = saved
+            else:
+                state["write_failed"] = True
+
         try:
             parts = split_audio(audio)
             for index, part in enumerate(parts, 1):
                 if len(parts) > 1:
                     self.after(0, self._set_status,
                                f"transcribing {index}/{len(parts)}")
-                text = self._transcribe_piece(part)
-                if text:
-                    done.append(text)
-                    if len(parts) > 1:
-                        path = append_partial(path, text)
-            self.after(0, self._done, " ".join(done).strip(), path)
+                self._transcribe_piece(part, keep)
+            self.after(0, self._done, " ".join(done).strip(), state["path"],
+                       state["write_failed"])
         except Exception as e:
-            rescue = " ".join(done).strip()
-            if not rescue:                      # ни одного куска не вышло —
-                path = save_audio(audio)        # сохраняем хотя бы звук
-            self.after(0, self._fail, str(e), rescue, path)
+            # Звук сохраняем всегда: даже если часть текста получена, остаток
+            # записи существовал только в памяти и иначе пропал бы.
+            audio_path = save_audio(audio)
+            self.after(0, self._fail, str(e), " ".join(done).strip(),
+                       state["path"] or audio_path)
 
-    def _done(self, text, path=None):
+    def _done(self, text, path=None, write_failed=False):
         self.busy = False
         if not text:
             self._set_status("no speech")
             return
+        error = None
         if path is None and len(text) > LONG_TEXT_CHARS:
-            path = save_transcript(text)
-        self._copy(text)
-        # Вставляем только в то окно, откуда начинали диктовать. Пока шло
-        # распознавание, фокус мог уехать в чужой чат — туда текст не полетит.
-        if foreground_is_self():
+            path, error = save_transcript(text)
+        # Сначала history, потом буфер и вставка: если буфер обмена захвачен
+        # другим приложением, текст всё равно уже сохранён и виден в окне.
+        self._add_history(text, path)
+        copied = self._copy(text)
+
+        if error or write_failed:
+            self._set_status(f"not saved to file: {error or 'write failed'}",
+                             error=True)
+        elif not copied:
+            self._set_status("clipboard busy · kept in history", error=True)
+        elif foreground_is_self():
             self._set_status("copied")
-        elif self.target_window and foreground_window() != self.target_window:
+        elif not self.target_window:
+            self._set_status("copied")
+        elif foreground_window() != self.target_window:
+            # пока шло распознавание, фокус уехал — туда текст не отправляем
             self._set_status("copied · window changed")
         else:
             keyboard.send("ctrl+v")
             self._set_status("pasted")
-        self._add_history(text, path)
 
     def _fail(self, message, rescue="", path=None):
         """Даже когда запрос провалился, сделанное не пропадает: расшифрованные
@@ -1070,9 +1166,15 @@ class App(tk.Tk):
 
     # --- история -------------------------------------------------------------
     def _copy(self, text):
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.update_idletasks()
+        """Буфер обмена бывает захвачен другим приложением — тогда Tk бросает
+        исключение, и без обработки оно унесло бы уже готовый результат."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            return True
+        except Exception:
+            return False
 
     def _add_history(self, text, path=None):
         self.history.insert(0, (datetime.now().strftime("%H:%M"), text, path))
@@ -1147,10 +1249,29 @@ class App(tk.Tk):
                 pystray.MenuItem("Quit", lambda: self.after(0, self._quit)),
             )
             icon = pystray.Icon("groqer", render(32), "Groqer", menu)
-            threading.Thread(target=icon.run, daemon=True).start()
+
+            def run():
+                # Падение внутри потока не долетело бы до try снаружи, и окно
+                # продолжало бы прятаться в несуществующий трей.
+                try:
+                    icon.run()
+                except Exception:
+                    pass
+                finally:
+                    if not self.shutting_down:
+                        self.after(0, self._tray_gone)
+
+            threading.Thread(target=run, daemon=True).start()
             return icon
         except Exception:
             return None
+
+    def _tray_gone(self):
+        """Значка больше нет — окну нельзя прятаться, иначе приложение станет
+        недостижимым: ни окна, ни иконки, только процесс в памяти."""
+        self.tray = None
+        self._show()
+        self._set_status("tray unavailable · keep this window", error=True)
 
     def _show(self):
         self.deiconify()
@@ -1179,7 +1300,10 @@ class App(tk.Tk):
         """Выходим, только когда терять нечего: активную запись сохраняем
         звуком на диск, а начатую расшифровку дожидаемся — её результат
         иначе придёт в уже уничтоженное окно и пропадёт."""
+        # Флаг снимает и захват хоткея: его поток блокируется на чтении клавиш
+        # и позже дёрнул бы after() на уже уничтоженном интерпретаторе.
         self.shutting_down = True
+        self.capturing = False
         if self.recording:
             self.recording = False
             self.overlay.hide()
