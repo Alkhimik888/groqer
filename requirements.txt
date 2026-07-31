@@ -1,0 +1,6 @@
+sounddevice
+soundfile
+numpy
+requests
+keyboard
+pillow
