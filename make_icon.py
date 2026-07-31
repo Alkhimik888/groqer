@@ -104,7 +104,7 @@ def render(size, fill_alpha=255, ink_alpha=255):
     except Exception:
         _pixel_mic(md, big, ink)
     plate.alpha_composite(mark)
-    return plate.resize((size, size), Image.LANCZOS)
+    return plate.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def write_ico(path, images):

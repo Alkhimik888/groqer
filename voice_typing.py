@@ -604,7 +604,7 @@ class Overlay(tk.Toplevel):
                       fill=ACCENT_INK_RGB + (255,), anchor="mm")
         except Exception:
             self._draw_mic(draw, size)
-        return img.resize((self.SIZE, self.SIZE), Image.LANCZOS)
+        return img.resize((self.SIZE, self.SIZE), Image.Resampling.LANCZOS)
 
     def _pixels(self):
         """BGRA с предумноженной альфой — в таком виде их ждёт Windows."""
@@ -958,8 +958,10 @@ class App(tk.Tk):
             return True
         except Exception as e:
             self.hotkey_handle = None
-            self.after(100, lambda: self._set_status(f"hotkey busy: {e}",
-                                                     error=True))
+            # Текст берём сейчас: имя `e` Python удаляет на выходе из except,
+            # и отложенная лямбда получила бы NameError вместо сообщения.
+            msg = f"hotkey busy: {e}"
+            self.after(100, lambda m=msg: self._set_status(m, error=True))
             return False
 
     def _render_hotkey(self):
