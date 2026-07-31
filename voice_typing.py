@@ -60,12 +60,39 @@ ACCENT_INK_RGB = (20, 20, 15)
 API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODEL = "whisper-large-v3"
 SAMPLE_RATE = 16000
-HOTKEY = "left ctrl+space"
+DEFAULT_HOTKEY = "left ctrl+space"
+MODIFIERS = ("ctrl", "alt", "shift", "windows")
+
+
+def pretty_hotkey(combo):
+    """ctrl+space → Ctrl+Space. Левый и правый модификаторы показываем просто."""
+    names = {"ctrl": "Ctrl", "left ctrl": "Ctrl", "right ctrl": "Ctrl",
+             "alt": "Alt", "left alt": "Alt", "right alt": "Alt",
+             "shift": "Shift", "left shift": "Shift", "right shift": "Shift",
+             "windows": "Win", "space": "Space", "enter": "Enter",
+             "esc": "Esc", "tab": "Tab", "backspace": "Backspace"}
+    parts = [p.strip() for p in combo.split("+")]
+    return "+".join(names.get(p, p.upper() if len(p) == 1 else p.capitalize())
+                    for p in parts)
 HISTORY_SIZE = 5
+# Речь даёт примерно 950 знаков в минуту (140 слов на 7 знаков со пробелом).
+# Дольше минуты — текст уже не помещается в окно целиком, поэтому уходит файлом.
+LONG_TEXT_CHARS = 900
+# В списке показываем начало: 160 знаков — это три строки, и пять записей
+# помещаются в окно, не выдавливая друг друга.
+PREVIEW_CHARS = 160
 MIN_SECONDS = 0.3
-MAX_SECONDS = 600
+# Предохранитель: на бесплатном тарифе Groq суточная норма — 8 часов аудио,
+# поэтому одна запись не должна съедать её целиком.
+MAX_SECONDS = 7 * 3600
+# Groq принимает файл до 25 МБ — это около 40 минут нашего FLAC, поэтому режем
+# с запасом по получасу и склеиваем расшифровки.
+CHUNK_SECONDS = 1800
+# Насколько далеко от расчётной границы искать паузу, чтобы не резать по слову.
+CHUNK_SEARCH_SECONDS = 12
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
 # Проводник кэширует иконки по пути файла и не перечитывает их при перезаписи,
 # поэтому у обновлённого набора новое имя.
 ICON_FILE = "groqer.ico"
@@ -125,7 +152,9 @@ def mono_family():
         return MONO_FALLBACK
 
 
-APP_ID = "Groqer.VoiceTyping"
+# Это же имя Windows подставляет как заголовок всплывающих уведомлений,
+# поэтому оно короткое, без технического суффикса.
+APP_ID = "Groqer"
 
 
 def set_app_id():
@@ -248,10 +277,60 @@ class Recorder:
         if not chunks:
             return None, 0.0
         audio = np.concatenate(chunks, axis=0)
-        buf = io.BytesIO()
-        sf.write(buf, audio, SAMPLE_RATE, format="FLAC")
-        buf.seek(0)
-        return buf, len(audio) / SAMPLE_RATE
+        return audio, len(audio) / SAMPLE_RATE
+
+
+def save_transcript(text):
+    """Длинную расшифровку кладём файлом рядом с приложением: в окно такой
+    текст не помещается, а терять его нельзя. Возвращает путь или None."""
+    try:
+        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+        name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
+        path = os.path.join(TRANSCRIPTS_DIR, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+    except Exception:
+        return None
+
+
+def encode_flac(audio):
+    """FLAC в памяти: без потерь и примерно 10 КБ на секунду речи."""
+    buf = io.BytesIO()
+    sf.write(buf, audio, SAMPLE_RATE, format="FLAC")
+    buf.seek(0)
+    return buf
+
+
+def split_audio(audio):
+    """Режет длинную запись на куски не длиннее CHUNK_SECONDS.
+
+    Граница сдвигается к самому тихому месту в окне вокруг расчётной точки,
+    иначе разрез пришёлся бы на середину слова и оба куска потеряли бы его.
+    """
+    chunk = CHUNK_SECONDS * SAMPLE_RATE
+    if len(audio) <= chunk:
+        return [audio]
+
+    search = CHUNK_SEARCH_SECONDS * SAMPLE_RATE
+    window = SAMPLE_RATE // 10                      # шаг поиска — 100 мс
+    cuts, pos = [], chunk
+    while pos < len(audio):
+        lo, hi = max(0, pos - search), min(len(audio), pos + search)
+        quietest, best = None, pos
+        for start in range(lo, hi - window, window):
+            level = np.abs(audio[start:start + window]).mean()
+            if quietest is None or level < quietest:
+                quietest, best = level, start + window // 2
+        cuts.append(best)
+        pos = best + chunk
+
+    parts, prev = [], 0
+    for cut in cuts + [len(audio)]:
+        if cut > prev:
+            parts.append(audio[prev:cut])
+        prev = cut
+    return parts
 
 
 def transcribe(audio, api_key, language):
@@ -446,6 +525,11 @@ class Overlay(tk.Toplevel):
         """Догоняем курсор и ведём дыхание одной перерисовкой: косинус даёт
         плавную волну без рывков на разворотах, а UpdateLayeredWindow за тот
         же вызов задаёт и позицию, и общую прозрачность."""
+        # Страховка от рассинхрона: индикатор существует только пока идёт
+        # запись, что бы ни случилось с состоянием выше.
+        if not getattr(self.master, "recording", False):
+            self.hide()
+            return
         self.phase = (self.phase + self.FOLLOW_MS) % self.BREATH_MS
         wave = 0.5 + 0.5 * math.cos(2 * math.pi * self.phase / self.BREATH_MS)
         alpha = int(255 * (self.BREATH_FLOOR + (1 - self.BREATH_FLOOR) * wave))
@@ -479,6 +563,9 @@ class App(tk.Tk):
         self.busy = False
         self.history = []
         self.tick_job = None
+        self.capturing = False
+        self.hotkey_handle = None
+        self.hotkey = self.cfg.get("hotkey", DEFAULT_HOTKEY)
         self.mono = mono_family()
         self.scale = dpi_scale()
         # Тк рисует в физических пикселях, поэтому пункты шрифта пересчитываем
@@ -493,6 +580,8 @@ class App(tk.Tk):
         self._build()
         self.overlay = Overlay(self)
         self._bind_hotkey()
+        self.hinted_tray = False
+        self.tray = self._build_tray()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_icon(self):
@@ -576,9 +665,18 @@ class App(tk.Tk):
             w.bind("<Button-1>", lambda _e: self.toggle())
             w.bind("<Enter>", lambda _e: self._hover_button(True))
             w.bind("<Leave>", lambda _e: self._hover_button(False))
-        tk.Label(stage, text="Ctrl+Space", bg=STAGE, fg=MUTED,
-                 font=(self.mono, 8), anchor="w").pack(fill="x",
-                                                       pady=(self.S(9), 0))
+        # строка хоткея — кликом переводится в режим записи новой комбинации
+        self.hotkey_label = tk.Label(stage, bg=STAGE, fg=MUTED,
+                                     font=(self.mono, 8), anchor="w",
+                                     cursor="hand2", padx=self.S(4),
+                                     pady=self.S(2))
+        self.hotkey_label.pack(fill="x", pady=(self.S(9), 0))
+        self.hotkey_label.bind("<Button-1>", self._capture_hotkey)
+        self.hotkey_label.bind("<Enter>", lambda _e: self.capturing or
+                               self.hotkey_label.config(fg=INK))
+        self.hotkey_label.bind("<Leave>", lambda _e: self.capturing or
+                               self.hotkey_label.config(fg=MUTED))
+        self._render_hotkey()
 
         self._rule(root, (16, 0))
 
@@ -693,15 +791,59 @@ class App(tk.Tk):
     # --- горячая клавиша -----------------------------------------------------
     def _bind_hotkey(self):
         try:
-            keyboard.add_hotkey(HOTKEY, lambda: self.after(0, self.toggle),
-                                suppress=True)
+            self.hotkey_handle = keyboard.add_hotkey(
+                self.hotkey, lambda: self.after(0, self.toggle), suppress=True)
         except Exception as e:
+            self.hotkey_handle = None
             self.after(100, lambda: self._set_status(f"hotkey busy: {e}",
                                                      error=True))
 
+    def _render_hotkey(self):
+        self.hotkey_label.config(text=f"{pretty_hotkey(self.hotkey)}   ·  click to change",
+                                 bg=STAGE, fg=MUTED)
+
+    def _capture_hotkey(self, _=None):
+        """Как в привычных приложениях: строка становится приёмником — нажатая
+        комбинация и станет новым хоткеем."""
+        if self.capturing or self.recording:
+            return
+        self.capturing = True
+        self.hotkey_label.config(text="press keys…", bg=ACCENT, fg=ACCENT_INK)
+        try:
+            if self.hotkey_handle:
+                keyboard.remove_hotkey(self.hotkey_handle)
+        except Exception:
+            pass
+        threading.Thread(target=self._capture_worker, daemon=True).start()
+
+    def _capture_worker(self):
+        try:
+            combo = keyboard.read_hotkey(suppress=False)
+        except Exception:
+            combo = None
+        self.after(0, self._finish_capture, combo)
+
+    def _finish_capture(self, combo):
+        # без модификатора хоткей отбирал бы обычную клавишу у всей системы
+        if combo and any(m in combo for m in MODIFIERS):
+            self.hotkey = combo
+            self.cfg["hotkey"] = combo
+            save_config(self.cfg)
+        elif combo:
+            self._set_status("need a modifier key", error=True)
+        self._render_hotkey()
+        # Привязываем не сразу: клавиши ещё зажаты, и свежий хоткей поймал бы
+        # то же самое нажатие, мгновенно запустив запись. Флаг снимаем вместе
+        # с привязкой, чтобы в паузе toggle тоже не срабатывал.
+        self.after(600, self._rearm_hotkey)
+
+    def _rearm_hotkey(self):
+        self._bind_hotkey()
+        self.capturing = False
+
     # --- запись --------------------------------------------------------------
     def toggle(self):
-        if self.busy:
+        if self.busy or self.capturing:
             return
         self._stop() if self.recording else self._start()
 
@@ -726,7 +868,10 @@ class App(tk.Tk):
         if sec >= MAX_SECONDS:
             self._stop()
             return
-        self._set_status(f"recording {sec // 60}:{sec % 60:02d}")
+        hours, rest = divmod(sec, 3600)
+        clock = f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours \
+            else f"{rest // 60}:{rest % 60:02d}"
+        self._set_status(f"recording {clock}")
         self.tick_job = self.after(500, self._tick)
 
     def _stop(self):
@@ -745,9 +890,17 @@ class App(tk.Tk):
         threading.Thread(target=self._work, args=(audio,), daemon=True).start()
 
     def _work(self, audio):
+        """Длинная запись уходит кусками по очереди, тексты склеиваются."""
         try:
-            text = transcribe(audio, self.api_key, self.lang)
-            self.after(0, self._done, text)
+            parts = split_audio(audio)
+            done = []
+            for index, part in enumerate(parts, 1):
+                if len(parts) > 1:
+                    self.after(0, self._set_status,
+                               f"transcribing {index}/{len(parts)}")
+                done.append(transcribe(encode_flac(part), self.api_key,
+                                       self.lang))
+            self.after(0, self._done, " ".join(p for p in done if p).strip())
         except Exception as e:
             self.after(0, lambda: self._fail(str(e)))
 
@@ -756,13 +909,14 @@ class App(tk.Tk):
         if not text:
             self._set_status("no speech")
             return
+        path = save_transcript(text) if len(text) > LONG_TEXT_CHARS else None
         self._copy(text)
         if foreground_is_self():
             self._set_status("copied")
         else:
             keyboard.send("ctrl+v")
             self._set_status("pasted")
-        self._add_history(text)
+        self._add_history(text, path)
 
     def _fail(self, message):
         self.busy = False
@@ -774,8 +928,8 @@ class App(tk.Tk):
         self.clipboard_append(text)
         self.update_idletasks()
 
-    def _add_history(self, text):
-        self.history.insert(0, (datetime.now().strftime("%H:%M"), text))
+    def _add_history(self, text, path=None):
+        self.history.insert(0, (datetime.now().strftime("%H:%M"), text, path))
         del self.history[HISTORY_SIZE:]
         self._render_history()
 
@@ -786,7 +940,7 @@ class App(tk.Tk):
             tk.Label(self.hist_frame, text="—", bg=PAPER, fg=MUTED,
                      font=(self.mono, 9), anchor="w").pack(fill="x")
             return
-        for index, (stamp, text) in enumerate(self.history):
+        for index, (stamp, text, path) in enumerate(self.history):
             if index:
                 tk.Frame(self.hist_frame, bg=HAIRLINE, height=1).pack(fill="x")
             row = tk.Frame(self.hist_frame, bg=PAPER, cursor="hand2", pady=8)
@@ -794,29 +948,99 @@ class App(tk.Tk):
             time_lbl = tk.Label(row, text=stamp, bg=PAPER, fg=MUTED,
                                 font=(self.mono, 8), anchor="nw", width=6)
             time_lbl.pack(side="left", anchor="n")
-            body = tk.Label(row, text=text, bg=PAPER, fg=INK, font=(SANS, 10),
-                            anchor="w", justify="left",
+            column = tk.Frame(row, bg=PAPER)
+            column.pack(side="left", fill="x", expand=True)
+            preview = text if len(text) <= PREVIEW_CHARS \
+                else text[:PREVIEW_CHARS].rstrip() + "…"
+            body = tk.Label(column, text=preview, bg=PAPER, fg=INK,
+                            font=(SANS, 10), anchor="w", justify="left",
                             wraplength=self.S(300))
-            body.pack(side="left", fill="x", expand=True)
-            for w in (row, time_lbl, body):
-                w.bind("<Button-1>", lambda _e, t=text: self._copy_again(t))
-                w.bind("<Enter>", lambda _e, r=row, b=body, t=time_lbl:
-                       [x.config(bg=STAGE) for x in (r, b, t)])
-                w.bind("<Leave>", lambda _e, r=row, b=body, t=time_lbl:
-                       [x.config(bg=PAPER) for x in (r, b, t)])
+            body.pack(fill="x")
+            tiles = [row, time_lbl, column, body]
+            if path:
+                # длинный текст живёт файлом — показываем объём и даём открыть
+                note = tk.Label(column, bg=PAPER, fg=MUTED, font=(self.mono, 8),
+                                anchor="w", cursor="hand2",
+                                text=f"{len(text)} chars · {os.path.basename(path)}")
+                note.pack(fill="x", pady=(self.S(3), 0))
+                note.bind("<Button-1>", lambda _e, p=path: self._open_file(p))
+                tiles.append(note)
+            for w in tiles:
+                if not path or w is not tiles[-1]:
+                    w.bind("<Button-1>", lambda _e, t=text: self._copy_again(t))
+                w.bind("<Enter>", lambda _e, ws=tiles:
+                       [x.config(bg=STAGE) for x in ws])
+                w.bind("<Leave>", lambda _e, ws=tiles:
+                       [x.config(bg=PAPER) for x in ws])
 
     def _copy_again(self, text):
         self._copy(text)
         self.hint.config(text="copied")
         self.after(1500, lambda: self.hint.config(text=""))
 
+    def _open_file(self, path):
+        try:
+            os.startfile(path)
+        except Exception:
+            self.hint.config(text="file missing")
+            self.after(2000, lambda: self.hint.config(text=""))
+
+    # --- жизнь в трее ---------------------------------------------------------
+    def _build_tray(self):
+        """Значок в области уведомлений. Пока он есть, закрытие окна не
+        выключает приложение: хоткей продолжает работать в фоне."""
+        try:
+            import pystray
+            from make_icon import render
+        except Exception:
+            return None
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem("Open Groqer", lambda: self.after(0, self._show),
+                                 default=True),
+                pystray.MenuItem("Quit", lambda: self.after(0, self._quit)),
+            )
+            icon = pystray.Icon("groqer", render(32), "Groqer", menu)
+            threading.Thread(target=icon.run, daemon=True).start()
+            return icon
+        except Exception:
+            return None
+
+    def _show(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
     def _on_close(self):
+        """Крестик прячет окно, а не выключает приложение — выход через трей."""
+        if self.tray:
+            self.withdraw()
+            if not self.hinted_tray:
+                self.hinted_tray = True
+                try:
+                    # Имя приложения Windows ставит сверху сама, поэтому в
+                    # заголовке — состояние: пустой заголовок библиотека
+                    # заменила бы именем значка, и «Groqer» шёл бы дважды.
+                    self.tray.notify(
+                        f"{pretty_hotkey(self.hotkey)} works in any app, "
+                        "even with this window closed", "Running in background")
+                except Exception:
+                    pass
+            return
+        self._quit()
+
+    def _quit(self):
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
         if self.recording:
             self.recorder.stop()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         self.destroy()
 
 
