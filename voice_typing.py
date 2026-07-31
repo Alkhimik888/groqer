@@ -106,6 +106,9 @@ RETRY_DELAYS = [3, 12, 30]
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
+# Сигнал от повторного запуска: «покажи окно». Файл, а не сообщение окну,
+# потому что tkinter не принимает чужие WM-сообщения без хука wndproc.
+SHOW_FLAG = os.path.join(APP_DIR, "show.flag")
 # Проводник кэширует иконки по пути файла и не перечитывает их при перезаписи,
 # поэтому у обновлённого набора новое имя.
 ICON_FILE = "groqer.ico"
@@ -188,7 +191,17 @@ def claim_single_instance():
                                           ctypes.c_wchar_p]
         _instance_lock = kernel32.CreateMutexW(None, 0, "Groqer.SingleInstance")
         ERROR_ALREADY_EXISTS = 183
-        return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            # Копия уже работает (возможно, спрятана в трей). Клик по ярлыку
+            # должен открывать её окно, а не пропадать впустую — оставляем
+            # сигнал и уходим.
+            try:
+                with open(SHOW_FLAG, "w", encoding="utf-8"):
+                    pass
+            except Exception:
+                pass
+            return False
+        return True
     except Exception:
         return True
 
@@ -747,6 +760,7 @@ class App(tk.Tk):
         self.hinted_tray = False
         self.tray = self._build_tray()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(700, self._watch_show_flag)
 
     def _apply_icon(self):
         """Иконку ставим через WM_SETICON, а не iconbitmap.
@@ -1287,6 +1301,17 @@ class App(tk.Tk):
         self.deiconify()
         self.lift()
         self.focus_force()
+
+    def _watch_show_flag(self):
+        """Повторный запуск (ярлык, меню «Пуск») просит показать окно."""
+        try:
+            if os.path.exists(SHOW_FLAG):
+                os.remove(SHOW_FLAG)
+                self._show()
+        except Exception:
+            pass
+        if not self.shutting_down:
+            self.after(700, self._watch_show_flag)
 
     def _on_close(self):
         """Крестик прячет окно, а не выключает приложение — выход через трей."""
