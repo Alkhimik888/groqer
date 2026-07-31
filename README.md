@@ -9,11 +9,21 @@ and handles Russian as well as it handles English.
 
 ## Why this exists
 
-Polished dictation apps for Windows either run the model locally — which is slow
-on a laptop without a discrete GPU — or charge a subscription for a hosted one.
-Groqer is ~700 lines of Python that sit between your microphone and an API key
-you already have. Audio goes to `api.groq.com` and nowhere else; nothing is
-stored on disk.
+This was built around Groq specifically, for three reasons:
+
+- **The transcription is good.** `whisper-large-v3` is accurate on Russian, not
+  only on English — which is where most dictation tools quietly fall apart.
+- **It is genuinely free for this workload.** The free tier allows 20 requests
+  a minute, 2000 a day and 7200 seconds of audio an hour. Dictation never gets
+  near that ceiling, so day-to-day use costs nothing.
+- **It is fast.** Groq transcribes at roughly 200× real time, so a sentence
+  comes back before you have finished reaching for the mouse.
+
+The alternatives on Windows either run a model locally — slow on a laptop with
+integrated graphics, and weaker on Russian — or wrap a hosted one in a
+subscription. Groqer is a small Python app sitting between your microphone and
+an API key you already have. Audio goes to `api.groq.com` and nowhere else, and
+nothing is written to disk.
 
 ## Install
 
