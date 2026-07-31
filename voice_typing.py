@@ -18,6 +18,7 @@ import json
 import math
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -163,6 +164,29 @@ def mono_family():
 # Это же имя Windows подставляет как заголовок всплывающих уведомлений,
 # поэтому оно короткое, без технического суффикса.
 APP_ID = "Groqer"
+_instance_lock = None
+
+
+def claim_single_instance():
+    """Разрешаем ровно один экземпляр.
+
+    Второй ловил бы тот же горячий ключ и запускал бы собственную запись
+    параллельно с первым: индикаторы висят, запись идёт по кругу, и понять,
+    какая копия чем занята, невозможно.
+    """
+    global _instance_lock
+    try:
+        # use_last_error обязателен: обычный ctypes.windll не сохраняет код
+        # ошибки, и проверка «мьютекс уже существует» молча не срабатывает
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_wchar_p]
+        _instance_lock = kernel32.CreateMutexW(None, 0, "Groqer.SingleInstance")
+        ERROR_ALREADY_EXISTS = 183
+        return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
 
 
 def set_app_id():
@@ -1197,6 +1221,8 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    if not claim_single_instance():
+        sys.exit(0)
     set_app_id()
     enable_dpi_awareness()
     App().mainloop()
