@@ -85,11 +85,19 @@ MIN_SECONDS = 0.3
 # Предохранитель: на бесплатном тарифе Groq суточная норма — 8 часов аудио,
 # поэтому одна запись не должна съедать её целиком.
 MAX_SECONDS = 7 * 3600
+# Сколько ждать распознавание при выходе (шаг 0,5 с) — десять минут с запасом
+# хватает даже длинной записи, дальше выходим, чтобы не держать пользователя.
+QUIT_MAX_WAITS = 1200
 # Groq принимает файл до 25 МБ — это около 40 минут нашего FLAC, поэтому режем
 # с запасом по получасу и склеиваем расшифровки.
 CHUNK_SECONDS = 1800
 # Насколько далеко от расчётной границы искать паузу, чтобы не резать по слову.
 CHUNK_SEARCH_SECONDS = 12
+# Потолок Groq — 25 МБ на запрос. Держим запас: сжатие FLAC зависит от голоса и
+# шума, и на плотной начитке кусок может оказаться крупнее расчётного.
+MAX_UPLOAD_BYTES = 23 * 1024 * 1024
+# Паузы между повторами при временных сбоях сети и лимитов.
+RETRY_DELAYS = [3, 12, 30]
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 TRANSCRIPTS_DIR = os.path.join(APP_DIR, "transcripts")
@@ -236,6 +244,13 @@ def write_api_key(key):
         f.write("\n".join(lines) + "\n")
 
 
+def foreground_window():
+    try:
+        return ctypes.windll.user32.GetForegroundWindow()
+    except Exception:
+        return None
+
+
 def foreground_is_self():
     """True, если активно наше собственное окно — вставлять текст некуда."""
     try:
@@ -277,6 +292,9 @@ class Recorder:
         if not chunks:
             return None, 0.0
         audio = np.concatenate(chunks, axis=0)
+        # у семичасовой записи копия весит под гигабайт: держать обе разом
+        # незачем, а момент остановки — самое неудачное место для нехватки памяти
+        chunks.clear()
         return audio, len(audio) / SAMPLE_RATE
 
 
@@ -289,6 +307,34 @@ def save_transcript(text):
         path = os.path.join(TRANSCRIPTS_DIR, name)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+        return path
+    except Exception:
+        return None
+
+
+def append_partial(path, text):
+    """Дописываем каждый расшифрованный кусок сразу на диск: если дальше
+    оборвётся сеть, сделанное уже не пропадёт вместе с процессом."""
+    try:
+        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+        if path is None:
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = os.path.join(TRANSCRIPTS_DIR, stamp + ".txt")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text.strip() + " ")
+        return path
+    except Exception:
+        return path
+
+
+def save_audio(audio):
+    """Сырое аудио на диск — последняя линия обороны, когда расшифровать
+    не удалось или пользователь выходит прямо во время записи."""
+    try:
+        os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = os.path.join(TRANSCRIPTS_DIR, stamp + ".flac")
+        sf.write(path, audio, SAMPLE_RATE, format="FLAC")
         return path
     except Exception:
         return None
@@ -333,23 +379,48 @@ def split_audio(audio):
     return parts
 
 
+class Transient(RuntimeError):
+    """Сбой, который имеет смысл повторить: сеть, таймаут, 429, 5xx."""
+
+
 def transcribe(audio, api_key, language):
     data = {"model": MODEL, "response_format": "json", "temperature": "0"}
     if language != "auto":
         data["language"] = language
-    r = requests.post(
-        API_URL,
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"file": ("audio.flac", audio, "audio/flac")},
-        data=data, timeout=120,
-    )
+    try:
+        r = requests.post(
+            API_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": ("audio.flac", audio, "audio/flac")},
+            data=data, timeout=180,
+        )
+    except requests.RequestException as e:
+        raise Transient(f"network: {type(e).__name__}")
     if r.status_code == 401:
         raise RuntimeError("key rejected")
-    if r.status_code == 429:
-        raise RuntimeError("rate limit, wait a minute")
+    if r.status_code == 413:
+        raise RuntimeError("chunk too large")
+    if r.status_code == 429 or r.status_code >= 500:
+        raise Transient(f"groq {r.status_code}")
     if r.status_code >= 400:
         raise RuntimeError(f"groq {r.status_code}")
     return (r.json().get("text") or "").strip()
+
+
+def transcribe_retrying(audio, api_key, language, on_wait=None):
+    """Повторяем временные сбои: один моргнувший wi-fi не должен стоить
+    пользователю всей записи."""
+    delay = RETRY_DELAYS[0]
+    for attempt, delay in enumerate(RETRY_DELAYS + [None], 1):
+        try:
+            audio.seek(0)
+            return transcribe(audio, api_key, language)
+        except Transient as e:
+            if delay is None:
+                raise RuntimeError(f"{e} — gave up after {attempt} tries")
+            if on_wait:
+                on_wait(str(e), delay)
+            time.sleep(delay)
 
 
 # --- структуры Windows для индикатора ----------------------------------------
@@ -512,13 +583,21 @@ class Overlay(tk.Toplevel):
         user32.ReleaseDC(0, screen_dc)
 
     def _cursor_spot(self):
-        """Точка рядом с курсором, не вылезающая за край экрана."""
+        """Точка рядом с курсором, прижатая к границам всего рабочего стола.
+
+        Считаем по виртуальному экрану, а не по главному монитору: иначе на
+        втором мониторе маркер улетал бы к краю первого.
+        """
+        user32 = ctypes.windll.user32
         pt = _Point()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        x = min(max(pt.x + self.OFFSET[0], 0),
-                self.winfo_screenwidth() - self.SIZE)
-        y = min(max(pt.y + self.OFFSET[1], 0),
-                self.winfo_screenheight() - self.SIZE)
+        user32.GetCursorPos(ctypes.byref(pt))
+        SM_XVIRTUAL, SM_YVIRTUAL, SM_CXVIRTUAL, SM_CYVIRTUAL = 76, 77, 78, 79
+        left = user32.GetSystemMetrics(SM_XVIRTUAL)
+        top = user32.GetSystemMetrics(SM_YVIRTUAL)
+        width = user32.GetSystemMetrics(SM_CXVIRTUAL) or self.winfo_screenwidth()
+        height = user32.GetSystemMetrics(SM_CYVIRTUAL) or self.winfo_screenheight()
+        x = min(max(pt.x + self.OFFSET[0], left), left + width - self.SIZE)
+        y = min(max(pt.y + self.OFFSET[1], top), top + height - self.SIZE)
         return x, y
 
     def _follow(self):
@@ -564,6 +643,9 @@ class App(tk.Tk):
         self.history = []
         self.tick_job = None
         self.capturing = False
+        self.shutting_down = False
+        self.quit_waits = 0
+        self.target_window = None
         self.hotkey_handle = None
         self.hotkey = self.cfg.get("hotkey", DEFAULT_HOTKEY)
         self.mono = mono_family()
@@ -843,7 +925,7 @@ class App(tk.Tk):
 
     # --- запись --------------------------------------------------------------
     def toggle(self):
-        if self.busy or self.capturing:
+        if self.busy or self.capturing or self.shutting_down:
             return
         self._stop() if self.recording else self._start()
 
@@ -856,6 +938,8 @@ class App(tk.Tk):
         except Exception as e:
             self._set_status(f"no mic: {e}", error=True)
             return
+        # запоминаем, куда диктуем: пока идёт распознавание, фокус может уехать
+        self.target_window = None if foreground_is_self() else foreground_window()
         self.recording = True
         self._render_button()
         self.overlay.show()
@@ -889,38 +973,76 @@ class App(tk.Tk):
         self._set_status("transcribing")
         threading.Thread(target=self._work, args=(audio,), daemon=True).start()
 
+    def _transcribe_piece(self, audio):
+        """Один кусок. Если закодированный файл не влезает в лимит Groq,
+        делим пополам — иначе запрос вернёт ошибку и кусок пропадёт."""
+        buf = encode_flac(audio)
+        if buf.getbuffer().nbytes > MAX_UPLOAD_BYTES and \
+                len(audio) > SAMPLE_RATE * 60:
+            middle = len(audio) // 2
+            halves = [self._transcribe_piece(audio[:middle]),
+                      self._transcribe_piece(audio[middle:])]
+            return " ".join(h for h in halves if h)
+        return transcribe_retrying(
+            buf, self.api_key, self.lang,
+            on_wait=lambda reason, delay: self.after(
+                0, self._set_status, f"retry in {delay}s · {reason}"))
+
     def _work(self, audio):
-        """Длинная запись уходит кусками по очереди, тексты склеиваются."""
+        """Длинная запись уходит кусками по очереди. Каждый готовый кусок
+        сразу пишется на диск, поэтому обрыв на середине не стоит всей
+        записи."""
+        done, path = [], None
         try:
             parts = split_audio(audio)
-            done = []
             for index, part in enumerate(parts, 1):
                 if len(parts) > 1:
                     self.after(0, self._set_status,
                                f"transcribing {index}/{len(parts)}")
-                done.append(transcribe(encode_flac(part), self.api_key,
-                                       self.lang))
-            self.after(0, self._done, " ".join(p for p in done if p).strip())
+                text = self._transcribe_piece(part)
+                if text:
+                    done.append(text)
+                    if len(parts) > 1:
+                        path = append_partial(path, text)
+            self.after(0, self._done, " ".join(done).strip(), path)
         except Exception as e:
-            self.after(0, lambda: self._fail(str(e)))
+            rescue = " ".join(done).strip()
+            if not rescue:                      # ни одного куска не вышло —
+                path = save_audio(audio)        # сохраняем хотя бы звук
+            self.after(0, self._fail, str(e), rescue, path)
 
-    def _done(self, text):
+    def _done(self, text, path=None):
         self.busy = False
         if not text:
             self._set_status("no speech")
             return
-        path = save_transcript(text) if len(text) > LONG_TEXT_CHARS else None
+        if path is None and len(text) > LONG_TEXT_CHARS:
+            path = save_transcript(text)
         self._copy(text)
+        # Вставляем только в то окно, откуда начинали диктовать. Пока шло
+        # распознавание, фокус мог уехать в чужой чат — туда текст не полетит.
         if foreground_is_self():
             self._set_status("copied")
+        elif self.target_window and foreground_window() != self.target_window:
+            self._set_status("copied · window changed")
         else:
             keyboard.send("ctrl+v")
             self._set_status("pasted")
         self._add_history(text, path)
 
-    def _fail(self, message):
+    def _fail(self, message, rescue="", path=None):
+        """Даже когда запрос провалился, сделанное не пропадает: расшифрованные
+        куски идут в буфер и в историю, а без них на диск ложится звук."""
         self.busy = False
-        self._set_status(message, error=True)
+        if rescue:
+            self._copy(rescue)
+            self._add_history(rescue, path)
+            self._set_status(f"{message} · partial kept", error=True)
+        elif path:
+            self._add_history(f"[audio saved: {os.path.basename(path)}]", path)
+            self._set_status(f"{message} · audio saved", error=True)
+        else:
+            self._set_status(message, error=True)
 
     # --- история -------------------------------------------------------------
     def _copy(self, text):
@@ -1030,18 +1152,48 @@ class App(tk.Tk):
         self._quit()
 
     def _quit(self):
+        """Выходим, только когда терять нечего: активную запись сохраняем
+        звуком на диск, а начатую расшифровку дожидаемся — её результат
+        иначе придёт в уже уничтоженное окно и пропадёт."""
+        self.shutting_down = True
+        if self.recording:
+            self.recording = False
+            self.overlay.hide()
+            if self.tick_job:
+                self.after_cancel(self.tick_job)
+                self.tick_job = None
+            audio, seconds = self.recorder.stop()
+            if audio is not None and seconds >= MIN_SECONDS:
+                path = save_audio(audio)
+                if path:
+                    self._notify_tray(f"Recording saved: {os.path.basename(path)}",
+                                      "Saved before exit")
+
+        if self.busy and self.quit_waits < QUIT_MAX_WAITS:
+            if not self.quit_waits:
+                self._show()
+            self.quit_waits += 1
+            self._set_status("finishing transcription…")
+            self.after(500, self._quit)
+            return
+
         try:
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        if self.recording:
-            self.recorder.stop()
         if self.tray:
             try:
                 self.tray.stop()
             except Exception:
                 pass
         self.destroy()
+
+    def _notify_tray(self, message, title):
+        try:
+            if self.tray:
+                self.tray.notify(message, title)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
