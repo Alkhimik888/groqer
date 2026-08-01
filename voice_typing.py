@@ -49,6 +49,7 @@ SANS = "Segoe UI"                    # проза и подписи контро
 MONO = "Cascadia Mono"               # только данные: время, счётчики, состояния
 MONO_FALLBACK = "Consolas"
 ICON_FAMILY = "Segoe Fluent Icons"   # системные глифы Windows 11
+COPY_GLYPH = ""                # две страницы — системный знак «копировать»
 GLYPH_STOP = ""                # квадрат «стоп»
 
 # --- Индикатор записи ---------------------------------------------------------
@@ -78,10 +79,10 @@ def pretty_hotkey(combo):
 HISTORY_SIZE = 5
 # Речь даёт примерно 950 знаков в минуту (140 слов на 7 знаков со пробелом).
 # Дольше минуты — текст уже не помещается в окно целиком, поэтому уходит файлом.
-LONG_TEXT_CHARS = 900
+LONG_TEXT_CHARS = 4500
 # В списке показываем начало: 160 знаков — это три строки, и пять записей
 # помещаются в окно, не выдавливая друг друга.
-PREVIEW_CHARS = 160
+PREVIEW_CHARS = 150
 MIN_SECONDS = 0.3
 # Предохранитель: на бесплатном тарифе Groq суточная норма — 8 часов аудио,
 # поэтому одна запись не должна съедать её целиком.
@@ -752,7 +753,7 @@ class App(tk.Tk):
         self.title("Groqer")
         self._apply_icon()
         self.configure(bg=PAPER)
-        self.geometry(f"{self.S(420)}x{self.S(520)}")
+        self.geometry(f"{self.S(430)}x{self.S(580)}")
         self.minsize(self.S(380), self.S(440))
         self._build()
         self.overlay = Overlay(self)
@@ -860,8 +861,26 @@ class App(tk.Tk):
 
         tk.Label(root, text="recent", bg=PAPER, fg=MUTED,
                  font=(SANS, 9), anchor="w").pack(fill="x", pady=(self.S(12), 0))
-        self.hist_frame = tk.Frame(root, bg=PAPER)
-        self.hist_frame.pack(fill="both", expand=True, pady=(self.S(8), 0))
+        # Список прокручивается: раньше записи просто обрезались нижним краем
+        # окна, и последняя выглядела наползающей на предыдущую.
+        wrap = tk.Frame(root, bg=PAPER)
+        wrap.pack(fill="both", expand=True, pady=(self.S(8), 0))
+        self.hist_canvas = tk.Canvas(wrap, bg=PAPER, highlightthickness=0, bd=0)
+        self.hist_canvas.pack(side="left", fill="both", expand=True)
+        self.hist_bar = ttk.Scrollbar(wrap, orient="vertical",
+                                      command=self.hist_canvas.yview,
+                                      style="Groqer.Vertical.TScrollbar")
+        self.hist_canvas.configure(yscrollcommand=self._on_scroll)
+        self.hist_frame = tk.Frame(self.hist_canvas, bg=PAPER)
+        self.hist_window = self.hist_canvas.create_window(
+            (0, 0), window=self.hist_frame, anchor="nw")
+        self.hist_frame.bind("<Configure>", lambda _e: self.hist_canvas.configure(
+            scrollregion=self.hist_canvas.bbox("all")))
+        self.hist_canvas.bind("<Configure>", self._on_canvas_resize)
+        # колесо ловим, только пока курсор над списком
+        wrap.bind("<Enter>", lambda _e: self.bind_all("<MouseWheel>", self._on_wheel))
+        wrap.bind("<Leave>", lambda _e: self.unbind_all("<MouseWheel>"))
+        self.body_labels = []
         self._render_history()
 
         foot = tk.Frame(root, bg=PAPER)
@@ -952,6 +971,17 @@ class App(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.option_add("*TCombobox*Listbox.selectForeground", ACCENT_INK)
         self.option_add("*TCombobox*Listbox.font", f"{{{self.mono}}} 8")
+        style.configure("Groqer.Vertical.TScrollbar", background=EDGE,
+                        troughcolor=PAPER, bordercolor=PAPER, arrowcolor=MUTED,
+                        lightcolor=PAPER, darkcolor=PAPER, relief="flat",
+                        arrowsize=self.S(10), width=self.S(9))
+        style.map("Groqer.Vertical.TScrollbar",
+                  background=[("active", MUTED), ("pressed", INK)])
+        # без кнопок-стрелок: в системе они давно не нужны, остаётся ползунок
+        style.layout("Groqer.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb",
+                 {"expand": "1", "sticky": "nswe"})]})])
 
     def _on_language(self, _=None):
         label = self.lang_var.get()
@@ -1201,49 +1231,99 @@ class App(tk.Tk):
             return False
 
     def _add_history(self, text, path=None):
-        self.history.insert(0, (datetime.now().strftime("%H:%M"), text, path))
+        self.history.insert(0, {"stamp": datetime.now().strftime("%H:%M"),
+                                "text": text, "path": path, "open": False})
         del self.history[HISTORY_SIZE:]
+        self._render_history()
+
+    def _on_scroll(self, first, last):
+        """Полоса появляется, только когда список не помещается целиком."""
+        self.hist_bar.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.hist_bar.pack_forget()
+        elif not self.hist_bar.winfo_ismapped():
+            self.hist_bar.pack(side="right", fill="y")
+
+    def _on_canvas_resize(self, event):
+        """Ширину переносов считаем от реальной ширины окна, а не константой —
+        иначе при другом размере текст лез за край."""
+        self.hist_canvas.itemconfig(self.hist_window, width=event.width)
+        for lbl in self.body_labels:
+            try:
+                lbl.config(wraplength=max(self.S(120), event.width - self.S(92)))
+            except Exception:
+                pass
+
+    def _on_wheel(self, event):
+        self.hist_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _toggle_entry(self, entry):
+        entry["open"] = not entry.get("open")
         self._render_history()
 
     def _render_history(self):
         for w in self.hist_frame.winfo_children():
             w.destroy()
+        self.body_labels = []
         if not self.history:
             tk.Label(self.hist_frame, text="—", bg=PAPER, fg=MUTED,
                      font=(self.mono, 9), anchor="w").pack(fill="x")
             return
-        for index, (stamp, text, path) in enumerate(self.history):
+        width = self.hist_canvas.winfo_width() or self.S(390)
+        for index, entry in enumerate(self.history):
+            text, path = entry["text"], entry["path"]
             if index:
                 tk.Frame(self.hist_frame, bg=HAIRLINE, height=1).pack(fill="x")
-            row = tk.Frame(self.hist_frame, bg=PAPER, cursor="hand2", pady=8)
+            row = tk.Frame(self.hist_frame, bg=PAPER, pady=self.S(8))
             row.pack(fill="x")
-            time_lbl = tk.Label(row, text=stamp, bg=PAPER, fg=MUTED,
+            time_lbl = tk.Label(row, text=entry["stamp"], bg=PAPER, fg=MUTED,
                                 font=(self.mono, 8), anchor="nw", width=6)
             time_lbl.pack(side="left", anchor="n")
+            # значок копирования — в углу, как принято в таких списках
+            copy_btn = tk.Label(row, text=COPY_GLYPH, bg=PAPER, fg=MUTED,
+                                font=(ICON_FAMILY, 10), cursor="hand2",
+                                padx=self.S(3))
+            copy_btn.pack(side="right", anchor="n")
             column = tk.Frame(row, bg=PAPER)
             column.pack(side="left", fill="x", expand=True)
-            preview = text if len(text) <= PREVIEW_CHARS \
-                else text[:PREVIEW_CHARS].rstrip() + "…"
-            body = tk.Label(column, text=preview, bg=PAPER, fg=INK,
+
+            long_text = len(text) > PREVIEW_CHARS
+            if entry.get("open"):
+                shown = text[:LONG_TEXT_CHARS].rstrip()
+                if len(text) > LONG_TEXT_CHARS:
+                    shown += " …"
+            else:
+                shown = text[:PREVIEW_CHARS].rstrip() + "…" if long_text else text
+            body = tk.Label(column, text=shown, bg=PAPER, fg=INK,
                             font=(SANS, 10), anchor="w", justify="left",
-                            wraplength=self.S(300))
+                            wraplength=max(self.S(120), width - self.S(92)),
+                            cursor="hand2" if long_text else "")
             body.pack(fill="x")
+            self.body_labels.append(body)
+
             tiles = [row, time_lbl, column, body]
             if path:
-                # длинный текст живёт файлом — показываем объём и даём открыть
-                note = tk.Label(column, bg=PAPER, fg=MUTED, font=(self.mono, 8),
-                                anchor="w", cursor="hand2",
-                                text=f"{len(text)} chars · {os.path.basename(path)}")
-                note.pack(fill="x", pady=(self.S(3), 0))
+                # файл открывается кликом — подчёркиванием говорим, что это ссылка
+                note = tk.Label(column, bg=PAPER, fg=MUTED, cursor="hand2",
+                                font=(self.mono, 8, "underline"), anchor="w",
+                                text=f"{os.path.basename(path)} · {len(text)} chars")
+                note.pack(fill="x", pady=(self.S(4), 0))
                 note.bind("<Button-1>", lambda _e, p=path: self._open_file(p))
+                note.bind("<Enter>", lambda _e, w=note: w.config(fg=INK))
+                note.bind("<Leave>", lambda _e, w=note: w.config(fg=MUTED))
                 tiles.append(note)
-            for w in tiles:
-                if not path or w is not tiles[-1]:
-                    w.bind("<Button-1>", lambda _e, t=text: self._copy_again(t))
-                w.bind("<Enter>", lambda _e, ws=tiles:
-                       [x.config(bg=STAGE) for x in ws])
-                w.bind("<Leave>", lambda _e, ws=tiles:
-                       [x.config(bg=PAPER) for x in ws])
+
+            copy_btn.bind("<Button-1>", lambda _e, t=text: self._copy_again(t))
+            copy_btn.bind("<Enter>", lambda _e, w=copy_btn: w.config(fg=INK))
+            copy_btn.bind("<Leave>", lambda _e, w=copy_btn: w.config(fg=MUTED))
+            if long_text:                      # клик по тексту — развернуть
+                for w in (row, time_lbl, column, body):
+                    w.bind("<Button-1>", lambda _e, e=entry: self._toggle_entry(e))
+            for w in tiles + [copy_btn]:
+                w.bind("<Enter>", lambda _e, ws=tiles + [copy_btn]:
+                       [x.config(bg=STAGE) for x in ws], add="+")
+                w.bind("<Leave>", lambda _e, ws=tiles + [copy_btn]:
+                       [x.config(bg=PAPER) for x in ws], add="+")
 
     def _copy_again(self, text):
         self._copy(text)

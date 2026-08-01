@@ -82,7 +82,9 @@ dictated from. The status line tells you which happened:
   auto-detect, Russian, and English pinned to the top. Picking **English** while you speak
   Russian doesn't just do worse — it **translates** instead of transcribing. Use auto-detect
   or your real language.
-- **History** — the last 5 transcripts are listed; click one to copy it again.
+- **History** — the last 5 transcripts. The copy icon in the corner of an entry copies it
+  again; clicking the text itself expands the entry to its full length. The list scrolls
+  with the mouse wheel.
 - **Tray icon** — the app lives here. Closing the window does not quit it — the hotkey keeps
   working. Use **Quit** in the tray menu to actually exit.
 
@@ -92,8 +94,9 @@ There is no practical length limit — a lecture, an interview, a two-hour meeti
 
 - Long recordings are split into ~15-minute pieces at the nearest quiet moment (so no word
   is cut in half), transcribed separately, and joined back together.
-- Transcripts longer than about a minute of speech are saved to `transcripts\*.txt`, with a
-  link to the file in the history list.
+- Transcripts longer than about five minutes of speech are saved to `transcripts\*.txt`.
+  The history entry then shows the file name as an underlined link — click it to open the
+  file in Notepad.
 - A single recording is capped at 7 hours.
 - If transcription fails partway through, the parts already done are kept, and the raw audio
   is saved as a `.flac` file, so nothing is lost.
